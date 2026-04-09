@@ -9,11 +9,15 @@ from __future__ import annotations
 
 import inspect
 from pathlib import Path
+import sys
 
 import click
 import torch
 
-from boson_multimodal.model.higgs_audio import HiggsAudioModel
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 
 def _parse_dtype(value: str) -> torch.dtype:
@@ -31,7 +35,7 @@ def _parse_dtype(value: str) -> torch.dtype:
     return mapping[value]
 
 
-def _pick_text_token_id(model: HiggsAudioModel) -> int:
+def _pick_text_token_id(model) -> int:
     reserved_ids = {
         model.config.pad_token_id,
         model.config.audio_in_token_idx,
@@ -44,10 +48,22 @@ def _pick_text_token_id(model: HiggsAudioModel) -> int:
     return 0
 
 
+def _pick_higgs_audio_v2_text_token_id(model) -> int:
+    reserved_ids = {
+        model.config.pad_token_id,
+        model.config.audio_token_id,
+        model.config.audio_delay_token_id,
+    }
+    for candidate in (1, 42, 128, 256, 512, 1024):
+        if 0 <= candidate < model.config.vocab_size and candidate not in reserved_ids:
+            return candidate
+    return 0
+
+
 class HiggsAudioOnnxWrapper(torch.nn.Module):
     """Small wrapper that exposes only tensor inputs / outputs for ONNX export."""
 
-    def __init__(self, model: HiggsAudioModel):
+    def __init__(self, model):
         super().__init__()
         self.model = model
 
@@ -93,8 +109,39 @@ class HiggsAudioOnnxWrapper(torch.nn.Module):
         )
 
 
+class HiggsAudioV2OnnxWrapper(torch.nn.Module):
+    """Wrapper for Transformers' native HiggsAudioV2ForConditionalGeneration."""
+
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        audio_input_ids: torch.Tensor,
+        audio_input_ids_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask.bool(),
+            audio_input_ids=audio_input_ids,
+            audio_input_ids_mask=audio_input_ids_mask.bool(),
+            use_cache=False,
+            logits_to_keep=0,
+        )
+        logits = outputs.logits
+        return logits.reshape(
+            logits.shape[0],
+            logits.shape[1],
+            self.model.config.num_codebooks,
+            self.model.config.codebook_size,
+        )
+
+
 def _build_dummy_inputs(
-    model: HiggsAudioModel,
+    model,
     batch_size: int,
     text_seq_len: int,
     num_audio_inputs: int,
@@ -200,6 +247,39 @@ def _build_dummy_inputs(
     )
 
 
+def _build_higgs_audio_v2_dummy_inputs(
+    model,
+    batch_size: int,
+    text_seq_len: int,
+    audio_frames: int,
+    device: torch.device,
+):
+    if batch_size <= 0:
+        raise click.BadParameter("dummy_batch_size must be greater than 0.")
+    if text_seq_len <= 0:
+        raise click.BadParameter("dummy_text_seq_len must be greater than 0.")
+    if audio_frames <= 0:
+        raise click.BadParameter("dummy_audio_out_tokens must be greater than 0 for HiggsAudioV2 export.")
+    if text_seq_len < audio_frames + 1:
+        raise click.BadParameter("dummy_text_seq_len must be at least dummy_audio_out_tokens + 1.")
+
+    text_token_id = _pick_higgs_audio_v2_text_token_id(model)
+    input_ids = torch.full((batch_size, text_seq_len), text_token_id, dtype=torch.long, device=device)
+    attention_mask = torch.ones((batch_size, text_seq_len), dtype=torch.bool, device=device)
+    input_ids[:, :audio_frames] = model.config.audio_token_id
+
+    audio_input_ids = torch.randint(
+        low=0,
+        high=model.config.codebook_size,
+        size=(batch_size, audio_frames, model.config.num_codebooks),
+        dtype=torch.long,
+        device=device,
+    )
+    audio_input_ids_mask = torch.ones((batch_size, audio_frames), dtype=torch.bool, device=device)
+
+    return input_ids, attention_mask, audio_input_ids, audio_input_ids_mask
+
+
 def _export_onnx(
     wrapper: torch.nn.Module,
     args: tuple[torch.Tensor, ...],
@@ -262,6 +342,58 @@ def _export_onnx(
         export_kwargs["dynamo"] = use_dynamo
 
     torch.onnx.export(wrapper, **export_kwargs)
+
+
+def _export_higgs_audio_v2_onnx(
+    wrapper: torch.nn.Module,
+    args: tuple[torch.Tensor, ...],
+    output_path: Path,
+    opset: int,
+    use_external_data: bool,
+    use_dynamo: bool,
+) -> None:
+    export_kwargs = {
+        "args": args,
+        "f": output_path.as_posix(),
+        "input_names": [
+            "input_ids",
+            "attention_mask",
+            "audio_input_ids",
+            "audio_input_ids_mask",
+        ],
+        "output_names": ["audio_logits"],
+        "dynamic_axes": {
+            "input_ids": {0: "batch", 1: "text_seq"},
+            "attention_mask": {0: "batch", 1: "text_seq"},
+            "audio_input_ids": {0: "batch", 1: "audio_frames"},
+            "audio_input_ids_mask": {0: "batch", 1: "audio_frames"},
+            "audio_logits": {0: "batch", 1: "text_seq"},
+        },
+        "opset_version": opset,
+        "export_params": True,
+        "do_constant_folding": True,
+    }
+
+    signature = inspect.signature(torch.onnx.export)
+    if "external_data" in signature.parameters:
+        export_kwargs["external_data"] = use_external_data
+    elif "use_external_data_format" in signature.parameters:
+        export_kwargs["use_external_data_format"] = use_external_data
+
+    if "dynamo" in signature.parameters:
+        export_kwargs["dynamo"] = use_dynamo
+
+    torch.onnx.export(wrapper, **export_kwargs)
+
+
+def _detect_model_type(model_path: str) -> str | None:
+    try:
+        from transformers import AutoConfig
+
+        config = AutoConfig.from_pretrained(model_path, local_files_only=Path(model_path).exists())
+    except Exception:
+        return None
+    return getattr(config, "model_type", None)
 
 
 @click.command()
@@ -330,6 +462,53 @@ def main(
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     torch_device = torch.device(device)
+    model_type = _detect_model_type(model_path)
+
+    if model_type == "higgs_audio_v2":
+        try:
+            from transformers import HiggsAudioV2ForConditionalGeneration
+        except ImportError as exc:
+            raise click.ClickException(
+                "The installed transformers package does not provide HiggsAudioV2ForConditionalGeneration. "
+                "Use a newer Transformers build for model_type='higgs_audio_v2'."
+            ) from exc
+
+        model = HiggsAudioV2ForConditionalGeneration.from_pretrained(
+            model_path,
+            dtype=torch_dtype,
+            attn_implementation=attn_implementation.lower(),
+            local_files_only=Path(model_path).exists(),
+        )
+        model = model.to(torch_device)
+        model.eval()
+
+        wrapper = HiggsAudioV2OnnxWrapper(model).to(torch_device).eval()
+        dummy_inputs = _build_higgs_audio_v2_dummy_inputs(
+            model=model,
+            batch_size=dummy_batch_size,
+            text_seq_len=dummy_text_seq_len,
+            audio_frames=dummy_audio_out_tokens,
+            device=torch_device,
+        )
+
+        with torch.inference_mode():
+            _ = wrapper(*dummy_inputs)
+            _export_higgs_audio_v2_onnx(
+                wrapper=wrapper,
+                args=dummy_inputs,
+                output_path=output_path,
+                opset=opset,
+                use_external_data=external_data,
+                use_dynamo=dynamo,
+            )
+
+        click.echo(f"Exported native HiggsAudioV2 ONNX graph to {output_path}")
+        click.echo(
+            "Note: this exports the forward pass only. The custom autoregressive generate loop is intentionally excluded."
+        )
+        return
+
+    from boson_multimodal.model.higgs_audio import HiggsAudioModel
 
     model = HiggsAudioModel.from_pretrained(
         model_path,
@@ -340,7 +519,7 @@ def main(
     model = model.to(torch_device)
     model.eval()
 
-    wrapper = HiggsAudioOnnxWrapper(model).to(torch_device)
+    wrapper = HiggsAudioOnnxWrapper(model).to(torch_device).eval()
     dummy_inputs = _build_dummy_inputs(
         model=model,
         batch_size=dummy_batch_size,
