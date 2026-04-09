@@ -167,16 +167,15 @@ python3 generation.py \
 
 ## ONNX Export
 
-You can export the multimodal `forward()` graph to ONNX with the helper script below:
+To export the Hugging Face audio tokenizer (`bosonai/higgs-audio-v2-tokenizer`) decoder graph:
 
 ```bash
-python3 export_onnx.py \
---model-path /path/to/higgs-audio-checkpoint \
---output-path /path/to/higgs_audio.onnx
+python3 export_tokenizer_onnx.py \
+--model-id bosonai/higgs-audio-v2-tokenizer \
+--output-dir tokenizer_onnx \
+--loader legacy \
+--component decoder
 ```
 
-Important notes:
-
-- The script exports `forward()` only, not the custom autoregressive `generate()` loop.
-- For ONNX-friendly export it disables cache-specific / CUDA-graph-specific paths and uses `eager` attention by default.
-- ONNX tracing only keeps branches exercised by the dummy export inputs, so keep the dummy audio placeholder counts non-zero if you need the exported graph to support those modalities at runtime.
+The `bosonai/higgs-audio-v2-tokenizer` repository includes a legacy `model.pth` checkpoint used by the decoder path.
+The decoder ONNX graph converts generated audio codes to waveform samples.
