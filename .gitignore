@@ -199,3 +199,5 @@ result/
 
 # Ruff
 .ruff_cache/
+
+artifacts/**

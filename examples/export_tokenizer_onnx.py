@@ -21,6 +21,12 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 
+def _configure_utf8_stdio() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8")
+
+
 def _load_tokenizer_model(model_id: str, device: torch.device, dtype: torch.dtype):
     try:
         from transformers import HiggsAudioV2TokenizerConfig, HiggsAudioV2TokenizerModel
@@ -34,28 +40,36 @@ def _load_tokenizer_model(model_id: str, device: torch.device, dtype: torch.dtyp
     if Path(model_id).exists():
         model_path = Path(model_id)
     else:
-        model_path = Path(
-            snapshot_download(
-                model_id,
-                allow_patterns=["config.json", "model.pth", "preprocessor_config.json"],
+        model_path = model_id
+
+    try:
+        model = HiggsAudioV2TokenizerModel.from_pretrained(model_path)
+    except OSError:
+        if Path(model_id).exists():
+            resolved_model_path = Path(model_id)
+        else:
+            resolved_model_path = Path(
+                snapshot_download(
+                    model_id,
+                    allow_patterns=["config.json", "model.pth", "preprocessor_config.json"],
+                )
             )
-        )
 
-    config = HiggsAudioV2TokenizerConfig.from_pretrained(model_path)
-    model = HiggsAudioV2TokenizerModel(config)
+        config = HiggsAudioV2TokenizerConfig.from_pretrained(resolved_model_path)
+        model = HiggsAudioV2TokenizerModel(config)
 
-    state_path = model_path / "model.pth"
-    if not state_path.exists():
-        state_path = Path(hf_hub_download(model_id, filename="model.pth"))
+        state_path = resolved_model_path / "model.pth"
+        if not state_path.exists():
+            state_path = Path(hf_hub_download(model_id, filename="model.pth"))
 
-    state_dict = torch.load(state_path, map_location="cpu")
-    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
-    if missing_keys or unexpected_keys:
-        click.echo(
-            "Loaded model.pth with non-strict state_dict. "
-            f"missing={len(missing_keys)}, unexpected={len(unexpected_keys)}",
-            err=True,
-        )
+        state_dict = torch.load(state_path, map_location="cpu")
+        missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+        if missing_keys or unexpected_keys:
+            click.echo(
+                "Loaded model.pth with non-strict state_dict. "
+                f"missing={len(missing_keys)}, unexpected={len(unexpected_keys)}",
+                err=True,
+            )
 
     model.to(dtype=dtype)
     model.to(device)
@@ -160,11 +174,12 @@ def _export(
         "f": output_path.as_posix(),
         "input_names": input_names,
         "output_names": output_names,
-        "dynamic_axes": dynamic_axes,
         "opset_version": opset,
         "export_params": True,
         "do_constant_folding": True,
     }
+    if not dynamo:
+        export_kwargs["dynamic_axes"] = dynamic_axes
 
     signature = inspect.signature(torch.onnx.export)
     if "external_data" in signature.parameters:
@@ -389,4 +404,5 @@ def main(
 
 
 if __name__ == "__main__":
+    _configure_utf8_stdio()
     main()
